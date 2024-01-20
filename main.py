@@ -1,84 +1,56 @@
 import torch
-from tqdm import tqdm
+from torch import Tensor
+import nerfacc
 from data_loaders.tiny_data_loader import DataLoader
-# from data_loaders.lego_data_loader import DataLoader
-from display_utils.display_helper import display_image, create_video
-from NeRF.models.full_model import NerfModel
-from NeRF.nerf_forward_pass import EncodedModelInputs, ModelIteratorOverRayChunks
-from NeRF.positional_encoding import PositionalEncoding
-from NeRF.sample_points_from_rays import PointSamplerFromRays
-from NeRF.rays_from_camera_builder import RaysFromCameraBuilder
-from setup_utils import set_random_seeds, load_training_config_yaml, get_tensor_device
+from models.full_NeRF_model import NerfModel
+import torch.nn.functional as F
 
-set_random_seeds()
-training_config = load_training_config_yaml()
-device = get_tensor_device()
+num_positional_encoding_functions = 9
+num_directional_encoding_functions = 9
+
 data_manager = DataLoader(device)
 
-# training parameters
-lr = training_config['training_variables']['learning_rate']
-num_iters = training_config['training_variables']['num_iters']
-num_positional_encoding_functions = training_config['positional_encoding']['num_positional_encoding_functions']
-num_directional_encoding_functions = training_config['positional_encoding']['num_directional_encoding_functions']
-depth_samples_per_ray = training_config['rendering_variables']['depth_samples_per_ray']
-chunksize = training_config['rendering_variables']['samples_per_model_forward_pass']
+radiance_field = NerfModel(num_positional_encoding_functions, num_directional_encoding_functions).to(device)  # network: a NeRF model
+rays_o: Tensor = ...  # ray origins. (n_rays, 3)
+rays_d: Tensor = ...  # ray normalized directions. (n_rays, 3)
+optimizer = torch.optim.Adam(radiance_field.parameters(), lr=lr)  # optimizer
 
-# Misc parameters
-display_every = training_config['display_variables']['display_every']
-
-# Specify encoding classes
-position_encoder = PositionalEncoding(3, num_positional_encoding_functions, True)
-direction_encoder = PositionalEncoding(3, num_directional_encoding_functions, True)
-
-# Initialize model and optimizer
-model = NerfModel(num_positional_encoding_functions, num_directional_encoding_functions).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-# Setup ray classes
-point_sampler = PointSamplerFromRays(training_config)
-rays_from_camera_builder = RaysFromCameraBuilder(data_manager, device)
-
-encoded_model_inputs = EncodedModelInputs(position_encoder,
-                                          direction_encoder,
-                                          rays_from_camera_builder,
-                                          point_sampler,
-                                          depth_samples_per_ray)
+estimator = nerfacc.OccGridEstimator(...)
 
 
-psnrs = []
-for i in tqdm(range(num_iters)):
+def sigma_fn(t_starts: Tensor, t_ends: Tensor, ray_indices: Tensor) -> Tensor:
+    """ Define how to query density for the estimator."""
+    t_origins = rays_o[ray_indices]  # (n_samples, 3)
+    t_dirs = rays_d[ray_indices]  # (n_samples, 3)
+    positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+    sigmas = radiance_field.query_density(positions)
+    return sigmas  # (n_samples,)
 
-    target_img, target_tform_cam2world = data_manager.get_image_and_pose(i)
 
-    encoded_points_on_ray, encoded_ray_directions, depth_values = encoded_model_inputs.encoded_points_and_directions_from_camera(target_tform_cam2world)
+def rgb_sigma_fn(t_starts: Tensor, t_ends: Tensor, ray_indices: Tensor) -> Tuple[Tensor, Tensor]:
+    """ Query rgb and density values from a user-defined radiance field. """
+    t_origins = rays_o[ray_indices]  # (n_samples, 3)
+    t_dirs = rays_d[ray_indices]  # (n_samples, 3)
+    positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+    rgbs, sigmas = radiance_field(positions, condition=t_dirs)
+    return rgbs, sigmas  # (n_samples, 3), (n_samples,)
 
-    model_forward_iterator = ModelIteratorOverRayChunks(chunksize, encoded_points_on_ray, encoded_ray_directions, depth_values,
-                                                        target_img, model)
 
-    predicted_image = []
-    loss_sum = 0
-    for predicted_pixels, target_pixels in model_forward_iterator:
-        loss = torch.nn.functional.mse_loss(predicted_pixels, target_pixels)
-        loss.backward()
-        loss_sum += loss.detach()
+# Efficient Raymarching:
+# ray_indices: (n_samples,). t_starts: (n_samples,). t_ends: (n_samples,).
+ray_indices, t_starts, t_ends = estimator.sampling(
+    rays_o, rays_d, sigma_fn=sigma_fn, near_plane=0.2, far_plane=1.0,
+    early_stop_eps=1e-4, alpha_thre=1e-2,
+)
 
-        predicted_image.append(predicted_pixels)
+# Differentiable Volumetric Rendering.
+# colors: (n_rays, 3). opacity: (n_rays, 1). depth: (n_rays, 1).
+color, opacity, depth, extras = nerfacc.rendering(
+    t_starts, t_ends, ray_indices, n_rays=rays_o.shape[0], rgb_sigma_fn=rgb_sigma_fn
+)
 
-    optimizer.step()
-    optimizer.zero_grad()
-    model.zero_grad()
-
-    predicted_image = torch.concatenate(predicted_image, dim=0).reshape(target_img.shape[0], target_img.shape[1], 3)
-
-    if i % display_every == 0:
-        psnr = -10. * torch.log10(loss_sum)
-        psnrs.append(psnr.item())
-
-        print("Loss:", loss_sum)
-        display_image(i, display_every, psnrs, predicted_image, target_img)
-
-    if i == num_iters - 1:
-        #save_image(display_every, psnrs, predicted_image)
-        create_video()
-
-print('Done!')
+# Optimize: Both the network and rays will receive gradients
+optimizer.zero_grad()
+loss = F.mse_loss(color, color_gt)
+loss.backward()
+optimizer.step()
