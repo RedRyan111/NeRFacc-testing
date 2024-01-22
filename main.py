@@ -4,10 +4,13 @@ import nerfacc
 from data_loaders.tiny_data_loader import DataLoader
 from models.full_NeRF_model import NerfModel
 import torch.nn.functional as F
+from setup_utils import set_random_seeds, get_tensor_device
 
 num_positional_encoding_functions = 9
 num_directional_encoding_functions = 9
 
+set_random_seeds()
+device = get_tensor_device()
 data_manager = DataLoader(device)
 
 radiance_field = NerfModel(num_positional_encoding_functions, num_directional_encoding_functions).to(device)  # network: a NeRF model
