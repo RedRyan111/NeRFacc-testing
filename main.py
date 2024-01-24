@@ -14,10 +14,10 @@ device = get_tensor_device()
 data_manager = DataLoader(device)
 
 radiance_field = NerfModel(num_positional_encoding_functions, num_directional_encoding_functions).to(device)  # network: a NeRF model
-rays_o: Tensor = ...  # ray origins. (n_rays, 3)
-rays_d: Tensor = ...  # ray normalized directions. (n_rays, 3)
 optimizer = torch.optim.Adam(radiance_field.parameters(), lr=lr)  # optimizer
 
+rays_o: Tensor = ...  # ray origins. (n_rays, 3)
+rays_d: Tensor = ...  # ray normalized directions. (n_rays, 3)
 estimator = nerfacc.OccGridEstimator(...)
 
 
